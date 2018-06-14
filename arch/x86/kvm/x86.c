@@ -70,6 +70,8 @@
 #include <asm/mshyperv.h>
 #include <asm/hypervisor.h>
 
+#include <tmem/tmem_ops.h>
+
 #define CREATE_TRACE_POINTS
 #include "trace.h"
 
@@ -6660,6 +6662,168 @@ static void kvm_pv_kick_cpu_op(struct kvm *kvm, unsigned long flags, int apicid)
 	kvm_irq_delivery_to_apic(kvm, NULL, &lapic_irq, NULL);
 }
 
+static void check_gpa(struct kvm *kvm, gpa_t gpa, size_t size, char *name)
+{
+
+
+	gfn_t gfn = gpa >>PAGE_SHIFT;
+	struct kvm_memory_slot *slot  = gfn_to_memslot(kvm, gfn);
+	unsigned long addr = gfn_to_hva_memslot_prot(slot, gfn, NULL);
+
+	if (kvm_is_error_hva(addr)) {
+		pr_err("********");
+		pr_err("NAME: %s", name);
+		pr_err("HVA %p", (void *) addr);
+		pr_err("Slot's base address %p", (void *) slot->userspace_addr);
+		pr_err("Slot's base gfn %llx Guest gfn %llx", slot->base_gfn, gfn);
+		pr_err("kvm_is_error_hva fails");
+		pr_err("********");
+	}
+
+	if (!access_ok(VERIFY_READ, (void *) addr, size))
+		pr_err("access_ok fails");
+
+
+}
+
+static int kvm_pv_tmem_op(struct kvm *kvm, unsigned long cmd, gpa_t request_address)
+{
+	struct tmem_request request;
+	int ret = -ENOSYS;
+	void *key = NULL;
+	void *value = NULL;
+	long value_ptr = 0;
+	size_t key_len, value_len;
+
+	//check_gpa(kvm, request_address, sizeof(struct tmem_request), "REQUEST");
+
+	if (kvm_read_guest(kvm, request_address, &request, sizeof(request))) {
+		pr_err("KVM: Reading the request from guest failed");
+		ret = -EFAULT;
+		goto tmem_out;
+	}
+
+	switch (cmd) {
+	case PV_TMEM_GET_OP:
+
+		//check_gpa(kvm, (gpa_t) request.get.key, 1, "KEY(GET)");
+		//check_gpa(kvm, (gpa_t) request.get.value, 1, "VALUE(GET)");
+
+		key_len = request.get.key_len;
+		key = kmalloc(key_len, GFP_KERNEL);
+		if (!key) {
+			ret = -ENOMEM;
+			goto tmem_out;
+		}
+
+		if (kvm_read_guest(kvm, (gpa_t) request.get.key, key, key_len)) {
+			pr_err("KVM: Reading the key from guest failed");
+			ret = -EFAULT;
+			goto tmem_out;
+		}
+
+		ret = tmem_get(key, key_len, (void *) &value_ptr, &value_len);
+		if (ret < 0)
+			pr_err("Not found");
+/*
+		pr_err("GET Keylen %lu", key_len);
+		pr_err("GET Valuelen %lu", value_len);
+		pr_err("GET Value ptr %p", (void *) value_ptr);
+*/
+		if (kvm_write_guest(kvm, (gpa_t) request.get.value, (void *) value_ptr, value_len)) {
+			pr_err("KVM: TMEM_GET: Writing the value to guest failed");
+			ret = -EFAULT;
+		}
+
+		if (kvm_write_guest(kvm, (gpa_t) request.get.value_lenp, &value_len, sizeof(value_len))) {
+			pr_err("KVM: TMEM_GET: Writing the value length to guest failed");
+			ret = -EFAULT;
+		}
+
+		break;
+
+	case PV_TMEM_PUT_OP:
+
+		//check_gpa(kvm, (gpa_t) request.put.key, 1, "KEY(PUT)");
+		//check_gpa(kvm, (gpa_t) request.put.value, 1, "VALUE(PUT)");
+
+		key_len = request.put.key_len;
+		value_len = request.put.value_len;
+
+		key = kmalloc(key_len, GFP_KERNEL);
+		if (!key) {
+			ret = -ENOMEM;
+			goto tmem_out;
+		}
+
+		if (kvm_read_guest(kvm, (gpa_t) request.put.key, key, key_len)) {
+			pr_err("KVM: TMEM_PUT: Reading the key from guest failed");
+			ret = -EFAULT;
+			goto tmem_out;
+		}
+
+		value = kmalloc(min((size_t) TMEM_MAX, value_len), GFP_KERNEL);
+		if (!value) {
+			ret = -ENOMEM;
+			goto tmem_out;
+		}
+/*
+		pr_err("PUT Keylen %lu", key_len);
+		pr_err("PUT Value ptr %p", (void *) value);
+		pr_err("PUT Valuelen %lu", value_len);
+*/
+		if (kvm_read_guest(kvm, (gpa_t) request.put.value, value, value_len)) {
+			pr_err("KVM: TMEM_PUT: Reading the value from guest failed");
+			ret = -EFAULT;
+			goto tmem_out;
+		}
+
+
+		ret = tmem_put(key, key_len, value, value_len);
+
+		break;
+
+	case PV_TMEM_INVALIDATE_OP:
+		key_len = request.inval.key_len;
+		key = kmalloc(key_len, GFP_KERNEL);
+		if (!key) {
+			ret = -ENOMEM;
+			goto tmem_out;
+		}
+
+		if (kvm_read_guest(kvm, (gpa_t) request.inval.key, key, key_len)) {
+			pr_err("KVM: TMEM_INVALIDATE: Reading the key from guest failed");
+			ret = -EFAULT;
+			goto tmem_out;
+		}
+
+		tmem_invalidate(key, key_len);
+		ret = 0;
+
+		break;
+
+	default:
+		pr_err("KVM: Invalid tmem hypercall");
+	}
+
+
+	return ret;
+
+tmem_out:
+
+	if (key)
+		kfree(key);
+	if (value)
+		kfree(value);
+
+	if (ret)
+		pr_err("KVM: TMEM: Returning with code %d", ret);
+
+	return ret;
+}
+
+
+
 void kvm_vcpu_deactivate_apicv(struct kvm_vcpu *vcpu)
 {
 	vcpu->arch.apicv_active = false;
@@ -6709,6 +6873,10 @@ int kvm_emulate_hypercall(struct kvm_vcpu *vcpu)
 		ret = kvm_pv_clock_pairing(vcpu, a0, a1);
 		break;
 #endif
+       case KVM_HC_TMEM:
+               ret = kvm_pv_tmem_op(vcpu->kvm, a0, a1);
+               break;
+
 	default:
 		ret = -KVM_ENOSYS;
 		break;
